@@ -1,26 +1,30 @@
 """Tests for Monarch MCP Server tools."""
 
+import asyncio
 import json
-from unittest.mock import AsyncMock
 
+import pytest
+
+import monarch_mcp_server.server as server_module
 from monarch_mcp_server.server import (
+    add_transaction_tag,
+    categorize_transaction,
+    check_auth_status,
+    create_transaction,
+    create_transaction_category,
+    create_transaction_tag,
+    get_account_holdings,
     get_accounts,
-    get_transactions,
     get_budgets,
     get_cashflow,
-    get_account_holdings,
-    create_transaction,
-    update_transaction,
-    refresh_accounts,
-    check_auth_status,
+    get_monarch_client,
     get_transaction_categories,
-    get_transaction_tags,
-    set_transaction_tags,
-    create_transaction_tag,
-    categorize_transaction,
     get_transaction_category_groups,
-    create_transaction_category,
-    add_transaction_tag,
+    get_transaction_tags,
+    get_transactions,
+    refresh_accounts,
+    set_transaction_tags,
+    update_transaction,
 )
 
 
@@ -188,6 +192,97 @@ class TestGetAccountHoldings:
         assert "Error getting account holdings" in result
 
 
+class TestAuthenticationHardening:
+    def test_requires_manual_auth_instead_of_env_login(self, monkeypatch):
+        monkeypatch.setattr(
+            server_module.secure_session, "get_authenticated_client", lambda: None
+        )
+        monkeypatch.setenv("MONARCH_EMAIL", "user@example.com")
+        monkeypatch.setenv("MONARCH_PASSWORD", "secret")
+
+        class UnexpectedMonarchMoney:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("env-based login should not run")
+
+        monkeypatch.setattr(server_module, "MonarchMoney", UnexpectedMonarchMoney)
+
+        with pytest.raises(RuntimeError, match="Authentication needed"):
+            asyncio.run(get_monarch_client())
+
+    def test_check_auth_status_is_generic_when_authenticated(self, monkeypatch):
+        monkeypatch.setattr(server_module.secure_session, "load_token", lambda: "token")
+        monkeypatch.setenv("MONARCH_EMAIL", "user@example.com")
+
+        result = check_auth_status()
+
+        assert "configured" in result.lower()
+        assert "user@example.com" not in result
+        assert "keyring" not in result.lower()
+        assert "token found" not in result.lower()
+
+    def test_check_auth_status_hides_internal_errors(self, monkeypatch):
+        def raise_error():
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(server_module.secure_session, "load_token", raise_error)
+
+        result = check_auth_status()
+
+        assert "unavailable" in result.lower()
+        assert "boom" not in result
+        assert "traceback" not in result.lower()
+
+
+class TestWriteAccessDisabled:
+    def test_create_transaction_disabled(self, mock_monarch_client):
+        result = create_transaction(
+            date="2026-03-15",
+            account_id="acc-1",
+            amount=-25.00,
+            merchant_name="Coffee Shop",
+            category_id="cat-1",
+        )
+        assert "Write access disabled" in result
+        mock_monarch_client.create_transaction.assert_not_called()
+
+    def test_update_transaction_disabled(self, mock_monarch_client):
+        result = update_transaction("txn-1", category_id="cat-2")
+        assert "Write access disabled" in result
+        mock_monarch_client.update_transaction.assert_not_called()
+
+    def test_set_transaction_tags_disabled(self, mock_monarch_client):
+        result = set_transaction_tags("txn-1", ["tag-1"])
+        assert "Write access disabled" in result
+        mock_monarch_client.set_transaction_tags.assert_not_called()
+
+    def test_add_transaction_tag_disabled(self, mock_monarch_client):
+        result = add_transaction_tag("txn-1", "tag-2")
+        assert "Write access disabled" in result
+        mock_monarch_client.get_transaction_details.assert_not_called()
+        mock_monarch_client.set_transaction_tags.assert_not_called()
+
+    def test_create_transaction_tag_disabled(self, mock_monarch_client):
+        result = create_transaction_tag("new", "#0000ff")
+        assert "Write access disabled" in result
+        mock_monarch_client.create_transaction_tag.assert_not_called()
+
+    def test_categorize_transaction_disabled(self, mock_monarch_client):
+        result = categorize_transaction("txn-1", "cat-2")
+        assert "Write access disabled" in result
+        mock_monarch_client.update_transaction.assert_not_called()
+
+    def test_create_transaction_category_disabled(self, mock_monarch_client):
+        result = create_transaction_category("grp-1", "Coffee")
+        assert "Write access disabled" in result
+        mock_monarch_client.create_transaction_category.assert_not_called()
+
+    def test_refresh_accounts_disabled(self, mock_monarch_client):
+        result = refresh_accounts()
+        assert "Write access disabled" in result
+        mock_monarch_client.request_accounts_refresh.assert_not_called()
+
+
+@pytest.mark.usefixtures("enable_writes")
 class TestCreateTransaction:
     def test_creates_transaction(self):
         result = json.loads(
@@ -249,6 +344,7 @@ class TestCreateTransaction:
         assert "Error creating transaction" in result
 
 
+@pytest.mark.usefixtures("enable_writes")
 class TestUpdateTransaction:
     def test_updates_transaction(self):
         result = json.loads(update_transaction("txn-1", category_id="cat-2"))
@@ -318,6 +414,7 @@ class TestGetTransactionTags:
         assert "Error getting transaction tags" in result
 
 
+@pytest.mark.usefixtures("enable_writes")
 class TestSetTransactionTags:
     def test_sets_tags(self):
         result = json.loads(set_transaction_tags("txn-1", ["tag-1", "tag-2"]))
@@ -335,6 +432,7 @@ class TestSetTransactionTags:
         assert "Error setting transaction tags" in result
 
 
+@pytest.mark.usefixtures("enable_writes")
 class TestCreateTransactionTag:
     def test_creates_tag(self):
         result = json.loads(create_transaction_tag("new", "#0000ff"))
@@ -352,6 +450,7 @@ class TestCreateTransactionTag:
         assert "Error creating transaction tag" in result
 
 
+@pytest.mark.usefixtures("enable_writes")
 class TestCategorizeTransaction:
     def test_categorizes(self, mock_monarch_client):
         result = json.loads(categorize_transaction("txn-1", "cat-2"))
@@ -375,11 +474,14 @@ class TestGetTransactionCategoryGroups:
         assert result[0]["type"] == "expense"
 
     def test_handles_api_error(self, mock_monarch_client):
-        mock_monarch_client.get_transaction_category_groups.side_effect = Exception("boom")
+        mock_monarch_client.get_transaction_category_groups.side_effect = Exception(
+            "boom"
+        )
         result = get_transaction_category_groups()
         assert "Error getting transaction category groups" in result
 
 
+@pytest.mark.usefixtures("enable_writes")
 class TestCreateTransactionCategory:
     def test_creates_category(self):
         result = json.loads(create_transaction_category("grp-1", "Coffee"))
@@ -409,6 +511,7 @@ class TestCreateTransactionCategory:
         assert "Error creating transaction category" in result
 
 
+@pytest.mark.usefixtures("enable_writes")
 class TestAddTransactionTag:
     def test_appends_to_existing_tags(self, mock_monarch_client):
         result = json.loads(add_transaction_tag("txn-1", "tag-2"))
@@ -438,6 +541,7 @@ class TestAddTransactionTag:
         assert "Error adding transaction tag" in result
 
 
+@pytest.mark.usefixtures("enable_writes")
 class TestRefreshAccounts:
     def test_refreshes_accounts(self):
         result = json.loads(refresh_accounts())

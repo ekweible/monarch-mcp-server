@@ -1,15 +1,11 @@
-"""
-Secure session management for Monarch Money MCP Server.
-
-Uses the system keyring when available, with an automatic file-based
-fallback for environments without a keyring backend (e.g. WSL, headless Linux).
-"""
+"""Secure session management for Monarch Money MCP Server."""
 
 import logging
 import os
 import stat
 from pathlib import Path
 from typing import Optional
+
 from monarchmoney import MonarchMoney
 
 logger = logging.getLogger(__name__)
@@ -17,39 +13,42 @@ logger = logging.getLogger(__name__)
 # Keyring service identifiers
 KEYRING_SERVICE = "com.mcp.monarch-mcp-server"
 KEYRING_USERNAME = "monarch-token"
+PLAINTEXT_FALLBACK_ENV_VAR = "MONARCH_ALLOW_PLAINTEXT_TOKEN_STORAGE"
 
 # File-based fallback location
 _TOKEN_DIR = Path.home() / ".monarch-mcp-server"
 _TOKEN_FILE = _TOKEN_DIR / "token"
 
 
+def _plaintext_fallback_allowed() -> bool:
+    return os.getenv(PLAINTEXT_FALLBACK_ENV_VAR, "").lower() == "true"
+
+
 def _keyring_available() -> bool:
     """Check whether a usable keyring backend is available."""
     try:
         import keyring
-        backend = keyring.get_keyring()
-        # The fail backend means no real backend was found
-        from keyrings.alt import file as _  # noqa: F401 – probe import
-        # If we get here, keyrings.alt is installed but may be the only option.
-        # Fall through and check the backend name.
-    except ImportError:
-        pass
 
-    try:
-        import keyring
         backend = keyring.get_keyring()
         backend_name = type(backend).__name__
-        # These backends indicate no real keyring is available
-        if backend_name in ("Keyring", "NullKeyring", "FailKeyring", "ChainerBackend"):
-            # ChainerBackend may wrap a real backend — try a round-trip test
-            if backend_name == "ChainerBackend":
-                try:
-                    keyring.set_password(KEYRING_SERVICE, "__probe__", "1")
-                    keyring.delete_password(KEYRING_SERVICE, "__probe__")
-                    return True
-                except Exception:
-                    return False
+        backend_module = type(backend).__module__
+
+        if backend_module == "keyring.backends.fail" or backend_name in (
+            "NullKeyring",
+            "FailKeyring",
+        ):
             return False
+
+        # These backends indicate no real keyring is available
+        if backend_name == "ChainerBackend":
+            # ChainerBackend may wrap a real backend — try a round-trip test
+            try:
+                keyring.set_password(KEYRING_SERVICE, "__probe__", "1")
+                keyring.delete_password(KEYRING_SERVICE, "__probe__")
+                return True
+            except Exception:
+                return False
+
         return True
     except Exception:
         return False
@@ -57,14 +56,21 @@ def _keyring_available() -> bool:
 
 class SecureMonarchSession:
     """Manages Monarch Money sessions securely using the system keyring,
-    falling back to a file-based store when no keyring backend is available."""
+    with optional file-based fallback when explicitly enabled."""
 
     def __init__(self) -> None:
         self._use_keyring = _keyring_available()
+        self._allow_file_fallback = _plaintext_fallback_allowed()
         if self._use_keyring:
             logger.info("🔐 Using system keyring for token storage")
+        elif self._allow_file_fallback:
+            logger.warning(
+                "⚠️  Keyring unavailable — plaintext token file fallback is enabled"
+            )
         else:
-            logger.info("🔐 Keyring unavailable — using file-based token storage")
+            logger.warning(
+                "⚠️  Keyring unavailable and plaintext token file fallback is disabled"
+            )
 
     # -- file-based helpers --------------------------------------------------
 
@@ -94,26 +100,42 @@ class SecureMonarchSession:
 
     # -- public API ----------------------------------------------------------
 
+    def _plaintext_fallback_error(self) -> RuntimeError:
+        return RuntimeError(
+            "System keyring unavailable and plaintext token storage is disabled. "
+            f"Set {PLAINTEXT_FALLBACK_ENV_VAR}=true to allow file fallback."
+        )
+
     def save_token(self, token: str) -> None:
         """Save the authentication token to the system keyring or file fallback."""
+        allow_file_fallback = _plaintext_fallback_allowed()
+
         if self._use_keyring:
             try:
                 import keyring
+
                 keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, token)
                 logger.info("✅ Token saved securely to keyring")
                 self._cleanup_old_session_files()
                 return
             except Exception as e:
+                if not allow_file_fallback:
+                    raise self._plaintext_fallback_error() from e
                 logger.warning(f"⚠️  Keyring save failed, falling back to file: {e}")
 
+        if not allow_file_fallback:
+            raise self._plaintext_fallback_error()
         self._save_token_file(token)
         self._cleanup_old_session_files()
 
     def load_token(self) -> Optional[str]:
         """Load the authentication token from the system keyring or file fallback."""
+        allow_file_fallback = _plaintext_fallback_allowed()
+
         if self._use_keyring:
             try:
                 import keyring
+
                 token = keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME)
                 if token:
                     logger.info("✅ Token loaded from keyring")
@@ -122,8 +144,14 @@ class SecureMonarchSession:
                     logger.info("🔍 No token found in keyring")
                     return None
             except Exception as e:
+                if not allow_file_fallback:
+                    logger.warning(f"⚠️  Keyring load failed: {e}")
+                    return None
                 logger.warning(f"⚠️  Keyring load failed, trying file fallback: {e}")
 
+        if not allow_file_fallback:
+            logger.info("🔍 No token found")
+            return None
         token = self._load_token_file()
         if token:
             return token
@@ -136,6 +164,7 @@ class SecureMonarchSession:
         if self._use_keyring:
             try:
                 import keyring
+
                 keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
                 logger.info("🗑️ Token deleted from keyring")
             except Exception:

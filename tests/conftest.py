@@ -1,6 +1,5 @@
 """Shared test fixtures for Monarch MCP Server tests."""
 
-import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -168,10 +167,24 @@ def mock_monarch_client():
     }
 
     client.create_transaction_tag.return_value = {
-        "createTransactionTag": {"tag": {"id": "tag-new", "name": "new", "color": "#0000ff"}}
+        "createTransactionTag": {
+            "tag": {"id": "tag-new", "name": "new", "color": "#0000ff"}
+        }
     }
 
     return client
+
+
+@pytest.fixture(autouse=True)
+def writes_disabled_by_default(monkeypatch):
+    """Default tests to read-only mode unless they opt into writes."""
+    monkeypatch.delenv("MONARCH_ENABLE_WRITES", raising=False)
+
+
+@pytest.fixture
+def enable_writes(monkeypatch, writes_disabled_by_default):
+    """Enable mutating tools for tests that need them."""
+    monkeypatch.setenv("MONARCH_ENABLE_WRITES", "true")
 
 
 @pytest.fixture(autouse=True)

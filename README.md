@@ -2,6 +2,15 @@
 
 # Monarch Money MCP Server
 
+Personal hardening fork for project-scoped local use.
+
+Differences from upstream:
+- manual one-time auth only; no env email/password login
+- keyring-first token storage; plaintext fallback is opt-in
+- write tools disabled unless `MONARCH_ENABLE_WRITES=true`
+
+Why: reduce auth/session risk while keeping the fork small and upstream-merge-friendly.
+
 A Model Context Protocol (MCP) server for integrating with the Monarch Money personal finance platform. This server provides seamless access to your financial accounts, transactions, budgets, and analytics through Claude Desktop and Claude Code.
 
 My MonarchMoney referral: https://www.monarchmoney.com/referral/ufmn0r83yf?r_source=share
@@ -69,6 +78,9 @@ My MonarchMoney referral: https://www.monarchmoney.com/referral/ufmn0r83yf?r_sou
 **OR**
 
 3. **Configure Claude Code** (CLI):
+
+   For this hardened fork, prefer project-level `.mcp.json` and avoid global MCP enablement.
+
    Add this to your Claude Code configuration file:
 
    **Global** (all projects):
@@ -152,7 +164,8 @@ uv run python login_setup.py
 Follow the prompts:
 - Enter your Monarch Money email and password
 - Provide 2FA code if you have MFA enabled
-- Session will be saved automatically
+- Your long-lived token will be stored in your system keyring
+- Plaintext file fallback stays disabled unless `MONARCH_ALLOW_PLAINTEXT_TOKEN_STORAGE=true`
 
 ### 3. Start Using
 
@@ -161,6 +174,8 @@ Once authenticated, use these tools directly in Claude Desktop or Claude Code:
 - `get_transactions` - Recent transactions with filtering
 - `get_budgets` - Budget information and spending
 - `get_cashflow` - Income/expense analysis
+
+Mutating tools are read-only by default in this fork. Set `MONARCH_ENABLE_WRITES=true` only when you intentionally want write access.
 
 ## ✨ Features
 
@@ -183,6 +198,8 @@ Once authenticated, use these tools directly in Claude Desktop or Claude Code:
 - **MFA Support**: Full support for two-factor authentication
 - **Session Persistence**: No need to re-authenticate frequently
 - **Secure**: Credentials never pass through Claude
+- **Keyring First**: Tokens go to the system keyring by default
+- **Write Gating**: Mutating tools require `MONARCH_ENABLE_WRITES=true`
 
 ## 🛠️ Available Tools
 

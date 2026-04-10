@@ -1,17 +1,18 @@
 """Monarch Money MCP Server - Main server implementation."""
 
-import os
-import logging
 import asyncio
-from typing import Any, Dict, Optional
 import json
+import logging
+import os
 from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, Optional
 
+import mcp.types as types
 from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
-import mcp.types as types
-from monarchmoney import MonarchMoney, RequireMFAException  # type: ignore
+from monarchmoney import MonarchMoney  # type: ignore
 from pydantic import BaseModel, Field
+
 from monarch_mcp_server.secure_session import secure_session
 
 # Configure logging
@@ -23,6 +24,8 @@ load_dotenv()
 
 # Initialize FastMCP server
 mcp = FastMCP("Monarch Money MCP Server")
+
+WRITE_ENABLE_ENV_VAR = "MONARCH_ENABLE_WRITES"
 
 
 def run_async(coro: Any) -> Any:
@@ -51,6 +54,17 @@ class MonarchConfig(BaseModel):
     )
 
 
+def _writes_enabled() -> bool:
+    return os.getenv(WRITE_ENABLE_ENV_VAR, "").lower() == "true"
+
+
+def _write_access_error() -> str:
+    return (
+        f"Write access disabled. Set {WRITE_ENABLE_ENV_VAR}=true to enable "
+        "mutating Monarch tools."
+    )
+
+
 async def get_monarch_client() -> MonarchMoney:
     """Get or create MonarchMoney client instance using secure session storage."""
     # Try to get authenticated client from secure session
@@ -59,26 +73,6 @@ async def get_monarch_client() -> MonarchMoney:
     if client is not None:
         logger.info("✅ Using authenticated client from secure keyring storage")
         return client
-
-    # If no secure session, try environment credentials
-    email = os.getenv("MONARCH_EMAIL")
-    password = os.getenv("MONARCH_PASSWORD")
-
-    if email and password:
-        try:
-            client = MonarchMoney()
-            await client.login(email, password)
-            logger.info(
-                "Successfully logged into Monarch Money with environment credentials"
-            )
-
-            # Save the session securely
-            secure_session.save_authenticated_session(client)
-
-            return client
-        except Exception as e:
-            logger.error(f"Failed to login to Monarch Money: {e}")
-            raise
 
     raise RuntimeError("🔐 Authentication needed! Run: python login_setup.py")
 
@@ -95,7 +89,7 @@ def setup_authentication() -> str:
    • Email and password
    • 2FA code if you have MFA enabled
 
-3️⃣ Session will be saved automatically and last for weeks
+3️⃣ Your token will be saved to the system keyring
 
 4️⃣ Start using Monarch tools in Claude Desktop:
    • get_accounts - View all accounts
@@ -103,7 +97,7 @@ def setup_authentication() -> str:
    • get_budgets - Budget information
 
 ✅ Session persists across Claude restarts
-✅ No need to re-authenticate frequently
+✅ Write tools stay disabled unless MONARCH_ENABLE_WRITES=true
 ✅ All credentials stay secure in terminal"""
 
 
@@ -111,41 +105,17 @@ def setup_authentication() -> str:
 def check_auth_status() -> str:
     """Check if already authenticated with Monarch Money."""
     try:
-        # Check if we have a token in the keyring
-        token = secure_session.load_token()
-        if token:
-            status = "✅ Authentication token found in secure keyring storage\n"
-        else:
-            status = "❌ No authentication token found in keyring\n"
-
-        email = os.getenv("MONARCH_EMAIL")
-        if email:
-            status += f"📧 Environment email: {email}\n"
-
-        status += (
-            "\n💡 Try get_accounts to test connection or run login_setup.py if needed."
-        )
-
-        return status
-    except Exception as e:
-        return f"Error checking auth status: {str(e)}"
+        if secure_session.load_token():
+            return "✅ Authentication appears configured. Try get_accounts to verify access."
+        return "🔐 Authentication required. Run: python login_setup.py"
+    except Exception:
+        return "Authentication status unavailable. Run python login_setup.py if needed."
 
 
-@mcp.tool()
+# Left undecorated so MCP clients cannot use it for reconnaissance.
 def debug_session_loading() -> str:
-    """Debug keyring session loading issues."""
-    try:
-        # Check keyring access
-        token = secure_session.load_token()
-        if token:
-            return f"✅ Token found in keyring (length: {len(token)})"
-        else:
-            return "❌ No token found in keyring. Run login_setup.py to authenticate."
-    except Exception as e:
-        import traceback
-
-        error_details = traceback.format_exc()
-        return f"❌ Keyring access failed:\nError: {str(e)}\nType: {type(e)}\nTraceback:\n{error_details}"
+    """Internal helper retained for local development only."""
+    return "Authentication debugging is disabled in this fork."
 
 
 @mcp.tool()
@@ -166,7 +136,11 @@ def get_accounts() -> str:
             type_name = type_info.get("name") if isinstance(type_info, dict) else None
 
             institution_info = account.get("institution", {})
-            institution_name = institution_info.get("name") if isinstance(institution_info, dict) else None
+            institution_name = (
+                institution_info.get("name")
+                if isinstance(institution_info, dict)
+                else None
+            )
 
             account_info = {
                 "id": account.get("id"),
@@ -175,7 +149,7 @@ def get_accounts() -> str:
                 "balance": account.get("currentBalance"),
                 "institution": institution_name,
                 "is_active": not account.get("deactivatedAt"),
-                "is_hidden": account.get("isHidden", False)
+                "is_hidden": account.get("isHidden", False),
             }
             account_list.append(account_info)
 
@@ -229,13 +203,13 @@ def get_transactions(
                 "date": txn.get("date"),
                 "amount": txn.get("amount"),
                 "description": txn.get("description"),
-                "category": txn.get("category", {}).get("name")
-                if txn.get("category")
-                else None,
+                "category": (
+                    txn.get("category", {}).get("name") if txn.get("category") else None
+                ),
                 "account": txn.get("account", {}).get("displayName"),
-                "merchant": txn.get("merchant", {}).get("name")
-                if txn.get("merchant")
-                else None,
+                "merchant": (
+                    txn.get("merchant", {}).get("name") if txn.get("merchant") else None
+                ),
                 "is_pending": txn.get("isPending", False),
             }
             transaction_list.append(transaction_info)
@@ -260,9 +234,7 @@ def get_budgets(
 
         async def _get_budgets() -> Any:
             client = await get_monarch_client()
-            return await client.get_budgets(
-                start_date=start_date, end_date=end_date
-            )
+            return await client.get_budgets(start_date=start_date, end_date=end_date)
 
         budgets = run_async(_get_budgets())
         return json.dumps(budgets, indent=2, default=str)
@@ -347,6 +319,9 @@ def create_transaction(
         notes: Optional notes for the transaction
         update_balance: Whether to update the account balance (default: false)
     """
+    if not _writes_enabled():
+        return _write_access_error()
+
     try:
 
         async def _create_transaction() -> Any:
@@ -401,6 +376,9 @@ def update_transaction(
         needs_review: Whether this transaction needs review
         notes: Notes for the transaction
     """
+    if not _writes_enabled():
+        return _write_access_error()
+
     try:
 
         async def _update_transaction() -> Any:
@@ -502,6 +480,9 @@ def create_transaction_category(
         rollover_enabled: Optional, whether budget rollover is enabled
         rollover_type: Optional rollover type (e.g. "monthly")
     """
+    if not _writes_enabled():
+        return _write_access_error()
+
     try:
 
         async def _create() -> Any:
@@ -561,6 +542,9 @@ def set_transaction_tags(transaction_id: str, tag_ids: list[str]) -> str:
         transaction_id: The ID of the transaction to tag
         tag_ids: List of tag IDs to assign. Pass [] to clear all tags.
     """
+    if not _writes_enabled():
+        return _write_access_error()
+
     try:
 
         async def _set() -> Any:
@@ -585,6 +569,9 @@ def add_transaction_tag(transaction_id: str, tag_id: str) -> str:
         transaction_id: The ID of the transaction
         tag_id: The tag ID to add
     """
+    if not _writes_enabled():
+        return _write_access_error()
+
     try:
 
         async def _add() -> Any:
@@ -614,6 +601,9 @@ def create_transaction_tag(name: str, color: str) -> str:
         name: Name of the new tag
         color: Hex color code for the tag (e.g. "#ff0000")
     """
+    if not _writes_enabled():
+        return _write_access_error()
+
     try:
 
         async def _create() -> Any:
@@ -636,6 +626,9 @@ def categorize_transaction(transaction_id: str, category_id: str) -> str:
         transaction_id: The ID of the transaction to categorize
         category_id: The category ID to assign
     """
+    if not _writes_enabled():
+        return _write_access_error()
+
     try:
 
         async def _categorize() -> Any:
@@ -654,6 +647,9 @@ def categorize_transaction(transaction_id: str, category_id: str) -> str:
 @mcp.tool()
 def refresh_accounts() -> str:
     """Request account data refresh from financial institutions."""
+    if not _writes_enabled():
+        return _write_access_error()
+
     try:
 
         async def _refresh_accounts() -> Any:
