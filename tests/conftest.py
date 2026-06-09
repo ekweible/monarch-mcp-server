@@ -1,6 +1,15 @@
 """Shared test fixtures for Monarch MCP Server tests."""
 
-from unittest.mock import AsyncMock, patch
+import json
+import sys
+from unittest.mock import AsyncMock, MagicMock, patch
+
+# Mock the monarchmoney module before any monarch_mcp_server imports
+mm_mock = MagicMock()
+mm_mock.MonarchMoney = MagicMock
+mm_mock.RequireMFAException = Exception
+sys.modules.setdefault("monarchmoney", mm_mock)
+sys.modules.setdefault("monarchmoney.monarchmoney", MagicMock())
 
 import pytest
 
@@ -42,21 +51,41 @@ def mock_monarch_client():
                     "id": "txn-1",
                     "date": "2026-03-01",
                     "amount": -42.50,
+                    "currencyCode": "CAD",
                     "description": "Grocery Store",
-                    "category": {"name": "Groceries"},
-                    "account": {"displayName": "Checking Account"},
+                    "plaidName": "WHOLE FOODS MARKET 10234",
+                    "category": {
+                        "id": "cat-1",
+                        "name": "Groceries",
+                        "group": {"id": "grp-1", "name": "Food", "type": "expense"},
+                    },
+                    "account": {"id": "acc-1", "displayName": "Checking Account"},
                     "merchant": {"name": "Whole Foods"},
                     "isPending": False,
+                    "needsReview": True,
+                    "notes": "weekly groceries",
+                    "isRecurring": False,
+                    "reviewStatus": "needs_review",
+                    "isSplitTransaction": False,
+                    "hideFromReports": False,
+                    "tags": [{"id": "tag-1", "name": "business"}],
                 },
                 {
                     "id": "txn-2",
                     "date": "2026-03-02",
                     "amount": 3000.00,
                     "description": "Paycheck",
-                    "category": {"name": "Income"},
-                    "account": {"displayName": "Checking Account"},
+                    "category": {"id": "cat-3", "name": "Income"},
+                    "account": {"id": "acc-1", "displayName": "Wise USD Balance"},
                     "merchant": None,
                     "isPending": False,
+                    "needsReview": False,
+                    "notes": None,
+                    "isRecurring": True,
+                    "reviewStatus": "reviewed",
+                    "isSplitTransaction": False,
+                    "hideFromReports": False,
+                    "tags": [],
                 },
             ]
         }
@@ -126,13 +155,13 @@ def mock_monarch_client():
                 "id": "cat-1",
                 "name": "Groceries",
                 "icon": "🛒",
-                "group": {"id": "grp-1", "name": "Food"},
+                "group": {"id": "grp-1", "name": "Food", "type": "expense"},
             },
             {
                 "id": "cat-2",
                 "name": "Dining Out",
                 "icon": "🍽️",
-                "group": {"id": "grp-1", "name": "Food"},
+                "group": {"id": "grp-1", "name": "Food", "type": "expense"},
             },
         ]
     }
@@ -172,7 +201,46 @@ def mock_monarch_client():
         }
     }
 
+    client.get_account_history.return_value = [
+        {
+            "date": "2026-04-20",
+            "signedBalance": 1000.0,
+            "accountId": "acc-1",
+            "accountName": "Checking Account",
+        },
+        {
+            "date": "2026-04-21",
+            "signedBalance": 1200.0,
+            "accountId": "acc-1",
+            "accountName": "Checking Account",
+        },
+        {
+            "date": "2026-04-22",
+            "signedBalance": 1100.0,
+            "accountId": "acc-1",
+            "accountName": "Checking Account",
+        },
+    ]
+
+    client.upload_account_balance_history.return_value = True
+
     return client
+
+
+_TOOL_MODULES = [
+    "monarch_mcp_server.client",
+    "monarch_mcp_server.tools.auth",
+    "monarch_mcp_server.tools.accounts",
+    "monarch_mcp_server.tools.transactions",
+    "monarch_mcp_server.tools.summaries",
+    "monarch_mcp_server.tools.splits",
+    "monarch_mcp_server.tools.tags",
+    "monarch_mcp_server.tools.rules",
+    "monarch_mcp_server.tools.categories",
+    "monarch_mcp_server.tools.budgets",
+    "monarch_mcp_server.tools.financial",
+    "monarch_mcp_server.tools.merchants",
+]
 
 
 @pytest.fixture(autouse=True)
@@ -189,10 +257,21 @@ def enable_writes(monkeypatch, writes_disabled_by_default):
 
 @pytest.fixture(autouse=True)
 def patch_monarch_client(mock_monarch_client):
-    """Automatically patch get_monarch_client for all tests."""
-    with patch(
-        "monarch_mcp_server.server.get_monarch_client",
-        new_callable=AsyncMock,
-        return_value=mock_monarch_client,
-    ):
+    """Automatically patch get_monarch_client wherever it's imported."""
+    patchers = []
+    for module_path in _TOOL_MODULES:
+        try:
+            p = patch(
+                f"{module_path}.get_monarch_client",
+                new_callable=AsyncMock,
+                return_value=mock_monarch_client,
+            )
+            p.start()
+            patchers.append(p)
+        except (AttributeError, ModuleNotFoundError):
+            pass
+    try:
         yield mock_monarch_client
+    finally:
+        for p in patchers:
+            p.stop()
